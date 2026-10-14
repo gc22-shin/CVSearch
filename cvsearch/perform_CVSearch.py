@@ -42,6 +42,8 @@ if __name__ == "__main__":
     parser.add_argument("--answers-file", type=str, default=None)
     parser.add_argument("--root-path", type=str, default=None)
     parser.add_argument("--nlp-model-path", type=str, default="models/en_core_web_sm-3.8.0")
+    parser.add_argument("--vlm-device", type=str, default="cuda:0")
+    parser.add_argument("--sam-device", type=str, default="cuda:1")
     parser.add_argument("--sam-model-path", type=str, default="models/facebook/sam3/sam3.pt")
     parser.add_argument("--model-path", type=str, default="models/Qwen2.5-VL-7B")
     parser.add_argument("--annotation_path", type=str, default="datasets/hr_data")
@@ -83,7 +85,7 @@ if __name__ == "__main__":
             "fast_threshold": 0.8
         }
     elif "internvl" in model_path.lower():
-        search_model = ModelInternvl(model_path=model_path, device="cuda:0", torch_dtype=torch.bfloat16,patch_scale=1.2)
+        search_model = ModelInternvl(model_path=model_path, device=args.vlm_device, torch_dtype=torch.bfloat16,patch_scale=1.2)
 
         def pop_limit_func(max_depth):
             return max_depth * 3
@@ -100,7 +102,7 @@ if __name__ == "__main__":
             kwargs = {"load_in_8bit": True}
         else:
             kwargs = {}
-        search_model = ModelQwenVL(model_path=model_path, device="cuda:0", torch_dtype=torch.bfloat16,patch_scale=1.2, **kwargs)
+        search_model = ModelQwenVL(model_path=model_path, device=args.vlm_device, torch_dtype=torch.bfloat16,patch_scale=1.2, **kwargs)
 
         def pop_limit_func(max_depth):
             return max_depth * 3
@@ -118,7 +120,7 @@ if __name__ == "__main__":
     print(search_kwargs)
 
     nlp = spacy.load(name=os.path.join(args.root_path, args.nlp_model_path))
-    sam3 = sam3_inference(model_path=os.path.join(args.root_path, args.sam_model_path))
+    sam3 = sam3_inference(model_path=os.path.join(args.root_path, args.sam_model_path), device=args.sam_device)
     decomposed_question_template = "What is the appearance of the {}?"
 
     ic_examples_path = f"ic_examples/{benchmark}.json"

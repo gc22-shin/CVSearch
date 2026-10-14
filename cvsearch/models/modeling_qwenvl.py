@@ -13,7 +13,7 @@ class ModelQwenVL:
         load_kwargs = {}
         load_in_8bit = kwargs.get("load_in_8bit", False)
         if load_in_8bit:
-            device_map = "auto"
+            device_map = {"": self.device}
         else:
             device_map = self.device
         self.use_flash_attn = True

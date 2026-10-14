@@ -17,6 +17,7 @@ NUM_CHUNKS=1
 CHUNK_IDX=0
 SPLIT_NUM=4
 GPU_ID=0
+SAM_GPU_ID=1
 
 # 2. Function to display help menu
 usage() {
@@ -26,7 +27,8 @@ usage() {
     echo "  --model_path <path>    Path to the MLLM model (default: ${MODEL_PATH})"
     echo "  --benchmark <name>     Benchmark dataset to evaluate (default: ${BENCHMARK})"
     echo "                         Choices: vstar, hr-bench_4k, hr-bench_8k, mme-realworld-lite, etc."
-    echo "  --gpu_id <id>          GPU device ID to use (default: ${GPU_ID})"
+    echo "  --gpu_id <id>          Physical GPU ID for the VLM (default: ${GPU_ID})"
+    echo "  --sam_gpu_id <id>      Physical GPU ID for SAM3 (default: ${SAM_GPU_ID})"
     echo "  --num_chunks <int>     Total number of chunks for parallel execution (default: ${NUM_CHUNKS})"
     echo "  --chunk_idx <int>      Index of the current chunk (default: ${CHUNK_IDX})"
     echo "  --help                 Show this help message"
@@ -42,6 +44,7 @@ while [[ "$#" -gt 0 ]]; do
         --model_path) MODEL_PATH="$2"; shift ;;
         --benchmark) BENCHMARK="$2"; shift ;;
         --gpu_id) GPU_ID="$2"; shift ;;
+        --sam_gpu_id) SAM_GPU_ID="$2"; shift ;;
         --num_chunks) NUM_CHUNKS="$2"; shift ;;
         --chunk_idx) CHUNK_IDX="$2"; shift ;;
         --help) usage ;;
@@ -51,7 +54,14 @@ while [[ "$#" -gt 0 ]]; do
 done
 
 # 4. Set the GPU device
-export CUDA_VISIBLE_DEVICES=${GPU_ID}
+# VLM -> cuda:0, SAM3 -> cuda:1 (logical indices after remapping)
+if [ "${GPU_ID}" = "${SAM_GPU_ID}" ]; then
+    export CUDA_VISIBLE_DEVICES=${GPU_ID}
+    SAM_DEVICE="cuda:0"
+else
+    export CUDA_VISIBLE_DEVICES=${GPU_ID},${SAM_GPU_ID}
+    SAM_DEVICE="cuda:1"
+fi
 
 # ==============================================================================
 
@@ -60,7 +70,7 @@ echo "🚀 Starting CVSearch Evaluation"
 echo "========================================================================"
 echo "Model     : ${MODEL_PATH}"
 echo "Benchmark : ${BENCHMARK}"
-echo "GPU ID    : ${CUDA_VISIBLE_DEVICES}"
+echo "GPU IDs    : ${CUDA_VISIBLE_DEVICES} (VLM=cuda:0, SAM3=${SAM_DEVICE})"
 echo "Chunks    : ${CHUNK_IDX} / ${NUM_CHUNKS}"
 echo "========================================================================"
 
@@ -71,6 +81,8 @@ python perform_CVSearch.py \
     --benchmark "${BENCHMARK}" \
     --annotation_path "${ANNOTATION_PATH}" \
     --sam-model-path "${SAM_MODEL_PATH}" \
+    --vlm-device "cuda:0" \
+    --sam-device "${SAM_DEVICE}" \
     --nlp-model-path "${NLP_MODEL_PATH}" \
     --num-chunks ${NUM_CHUNKS} \
     --chunk-idx ${CHUNK_IDX} \

@@ -30,11 +30,14 @@ except ImportError:
 import gc
 
 class sam3_inference():
-    def __init__(self, model_path):
-        self.model = build_sam3_image_model(checkpoint_path=model_path)
-        self.model.eval()
-        self.model.to("cuda")
-        self.processor = Sam3Processor(self.model)
+    def __init__(self, model_path, device="cuda:0"):
+        self.device = torch.device(device)
+        # sam3 internals use the bare "cuda" string, which resolves to the current device
+        with torch.cuda.device(self.device):
+            self.model = build_sam3_image_model(checkpoint_path=model_path, device=str(self.device))
+            self.model.eval()
+            self.model.to(self.device)
+            self.processor = Sam3Processor(self.model, device=str(self.device))
         self.transform = ComposeAPI(
                         transforms=[
                             RandomResizeAPI(sizes=1008, max_size=1008, square=True, consistent_transform=False),
@@ -56,8 +59,9 @@ class sam3_inference():
 
     @torch.inference_mode()
     def inference(self, image, text_prompt):
-        inference_state = self.processor.set_image(image)
-        output = self.processor.set_text_prompt(state=inference_state, prompt=text_prompt)
+        with torch.cuda.device(self.device):
+            inference_state = self.processor.set_image(image)
+            output = self.processor.set_text_prompt(state=inference_state, prompt=text_prompt)
 
         return output
 
@@ -111,10 +115,10 @@ class sam3_inference():
 
         datapoint = self.transform(datapoint)
         batch = collate([datapoint], dict_key="dummy")["dummy"]
-        batch = copy_data_to_device(batch, torch.device("cuda"), non_blocking=True)
-
-        output, backbone_out = self.model(batch)
-        processed_results = self.postprocessor.process_results(output, batch.find_metadatas)
+        with torch.cuda.device(self.device):
+            batch = copy_data_to_device(batch, self.device, non_blocking=True)
+            output, backbone_out = self.model(batch)
+            processed_results = self.postprocessor.process_results(output, batch.find_metadatas)
 
         return backbone_out, processed_results, text_id
 
