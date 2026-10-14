@@ -5,7 +5,7 @@
 # ==============================================================================
 
 # 1. Default configurations
-ROOT_PATH="/mnt/sdb/llp"
+ROOT_PATH="/data1/workspaces/jgshin22/GraduationProject/IndustryVLM"
 MODEL_PATH="models/Qwen3-VL-2B"
 BENCHMARK="vstar"
 
