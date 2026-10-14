@@ -6,7 +6,7 @@
 
 # 1. Default configurations
 ROOT_PATH="/data1/workspaces/jgshin22/GraduationProject/IndustryVLM"
-MODEL_PATH="models/Qwen3-VL-2B"
+MODEL_PATH="models/Qwen3-VL-2B-Instruct"
 BENCHMARK="vstar"
 
 ANNOTATION_PATH="datasets/hr_data"
