@@ -10,7 +10,7 @@ MODEL_PATH="models/Qwen3-VL-2B"
 BENCHMARK="vstar"
 
 ANNOTATION_PATH="datasets/hr_data"
-SAM_MODEL_PATH="models/facebook/sam3/sam3.pt"
+SAM_MODEL_PATH="models/sam3/sam3.pt"
 NLP_MODEL_PATH="models/en_core_web_sm-3.8.0"
 
 NUM_CHUNKS=1
