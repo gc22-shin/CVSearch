@@ -5,12 +5,12 @@
 # ==============================================================================
 
 # 1. Default configurations
-ROOT_PATH="/mnt/sdb/llp"
-MODEL_PATH="models/Qwen3-VL-2B"
+ROOT_PATH="/data1/workspaces/jgshin22/GraduationProject/IndustryVLM"
+MODEL_PATH="models/Qwen3-VL-2B-Instruct"
 BENCHMARK="vstar"
 
 ANNOTATION_PATH="datasets/hr_data"
-SAM_MODEL_PATH="models/facebook/sam3/sam3.pt"
+SAM_MODEL_PATH="models/sam3/sam3.pt"
 NLP_MODEL_PATH="models/en_core_web_sm-3.8.0"
 
 NUM_CHUNKS=1
