@@ -7,6 +7,9 @@ Modes:
   --direct-answer                 vanilla backbone baseline (no visual search)
   --search-target {object,defect} CVSearch pipeline; MMAD questions name no object, so the SAM3/search target is fixed:
                                   object = the product class (screw/capsule/leather), defect = the word "defect"
+  --patchcore <dir>               E5: if the image's PatchCore score is above the per-class threshold, add the main image
+                                  with the PatchCore top-1 box drawn + a zoomed crop of that box; otherwise answer directly
+                                  (<dir> = output of industrial/eval_patchcore.py + industrial/select_thresholds.py)
 """
 import argparse
 import collections
@@ -17,7 +20,7 @@ import sys
 import warnings
 
 import torch
-from PIL import Image
+from PIL import Image, ImageDraw
 from tqdm import tqdm
 
 root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -36,6 +39,28 @@ def format_question(question, options):
     ret += (f"\nSelect the best answer to the above multiple-choice question based on the image. "
             f"Respond with only the letter ({letter_str}) of the correct option.\nThe best answer is:")
     return ret
+
+
+PC_PREFIX = ("<image>\nThis is the main image. An anomaly detector marked the region in the red rectangle as the most "
+             "unusual part of this product; it is a candidate only and may still be normal.\n"
+             "<image>\nThis is a zoomed-in view of the red rectangle.\n")
+
+
+def patchcore_views(model, image, box, width=4):
+    """Main image with the PatchCore box drawn + the box region zoomed (same zoom rule as CVSearch)."""
+    main = image.copy()
+    ImageDraw.Draw(main).rectangle(box, outline=(255, 0, 0), width=width)
+    return [main, model.zoom_in(image.crop(box))]
+
+
+@torch.inference_mode()
+def answer_with_images(model, images, qs):
+    prompt = model.get_prompt_from_qs(qs)
+    inputs = model.processor(text=[prompt], images=images, return_tensors="pt", padding=True, padding_side="left")
+    inputs = inputs.to(model.device)
+    ids = model.model.generate(**inputs, use_cache=True, max_new_tokens=256, do_sample=False)
+    return model.processor.batch_decode(ids[:, inputs.input_ids.shape[1]:], skip_special_tokens=True,
+                                        clean_up_tokenization_spaces=False)[0]
 
 
 def parse_letter(text, letters):
@@ -103,6 +128,9 @@ if __name__ == "__main__":
                         help="ignore SAM3 detections: always use the tree search (SAM3 image features still build the tree)")
     parser.add_argument("--no-second-search", action="store_true",
                         help="do not re-run SAM3 on the best tree candidate (search_mode=False)")
+    parser.add_argument("--patchcore", type=str, default=None,
+                        help="E5: dir with per_image.jsonl + thresholds.json (relative to --root-path)")
+    parser.add_argument("--pc-ungated", action="store_true", help="E5 ablation: add the PatchCore crop to every image")
     parser.add_argument("--sam-model-path", type=str, default="models/sam3/sam3/sam3.pt")
     parser.add_argument("--nlp-model-path", type=str, default="models/en_core_web_sm-3.8.0")
     parser.add_argument("--sam-device", type=str, default="cuda:1")
@@ -112,9 +140,14 @@ if __name__ == "__main__":
                         help="recompute summary.json from an existing outputs.jsonl (no model is loaded)")
     args = parser.parse_args()
 
-    if not args.direct_answer and not args.search_target and not args.rescore:
-        raise SystemExit("choose a mode: --direct-answer or --search-target {object,defect}")
-    mode = "direct_answer" if args.direct_answer else f"cvsearch_{args.search_target}" + ("_tree" if args.force_tree else "")
+    if not args.direct_answer and not args.search_target and not args.patchcore and not args.rescore:
+        raise SystemExit("choose a mode: --direct-answer, --search-target {object,defect} or --patchcore <dir>")
+    if args.direct_answer:
+        mode = "direct_answer"
+    elif args.patchcore:
+        mode = "patchcore" + ("_ungated" if args.pc_ungated else "")
+    else:
+        mode = f"cvsearch_{args.search_target}" + ("_tree" if args.force_tree else "")
 
     data_root = os.path.join(args.root_path, args.data_path)
     model_path = os.path.join(args.root_path, args.model_path)
@@ -147,6 +180,10 @@ if __name__ == "__main__":
                 "fast_threshold": 0.6,
             }
             ic_examples = json.load(open("ic_examples/vstar.json"))
+        if args.patchcore:
+            pc_dir = os.path.join(args.root_path, args.patchcore)
+            pc = {r["image"]: r for r in map(json.loads, open(os.path.join(pc_dir, "per_image.jsonl")))}
+            pc_thr = {c: v["threshold"] for c, v in json.load(open(os.path.join(pc_dir, "thresholds.json"))).items()}
         records = []
         with open(outputs_path, "w") as f:
             for q in tqdm(questions):
@@ -163,6 +200,16 @@ if __name__ == "__main__":
                         force_tree=args.force_tree, search_mode=not args.no_second_search, **search_kwargs)
                     extra = {k: ann.get(k) for k in ["search_mode", "root_ans_conf", "targets", "sam", "num_pop",
                                                      "searched_bbox"]}
+                elif args.patchcore:
+                    image = Image.open(image_file).convert("RGB")
+                    p = pc[q["image_path"]]
+                    use = args.pc_ungated or p["score"] > pc_thr[q["category"]]
+                    if use:
+                        raw = answer_with_images(model, patchcore_views(model, image, p["pc_box"]), PC_PREFIX + prompt)
+                    else:
+                        raw = model.free_form_using_nodes(image, prompt, [])  # same path as the direct-answer baseline
+                    extra = {"pc_score": p["score"], "pc_threshold": pc_thr[q["category"]], "pc_used": use,
+                             "pc_box": p["pc_box"]}
                 else:
                     image = Image.open(image_file).convert("RGB")
                     raw = model.free_form_using_nodes(image, prompt, [])  # empty node list = direct answering
@@ -175,6 +222,8 @@ if __name__ == "__main__":
 
     summary = summarize(records, options_by_qid)
     summary["config"] = {"model": args.model_path, "split": args.split, "mode": mode}
+    if any("pc_used" in r for r in records):
+        summary["patchcore_crop_questions"] = sum(bool(r["pc_used"]) for r in records)
     if any("search_mode" in r for r in records):
         summary["search_mode_counts"] = dict(collections.Counter(str(r.get("search_mode")) for r in records))
     json.dump(summary, open(os.path.join(out_dir, "summary.json"), "w"), indent=1)
