@@ -9,13 +9,14 @@ ROOT_PATH="/data1/workspaces/jgshin22/GraduationProject/IndustryVLM"
 MODEL_PATH="models/Qwen3-VL-2B-Instruct"
 BENCHMARK="vstar"
 
-ANNOTATION_PATH="datasets/hr_data"
-SAM_MODEL_PATH="models/sam3/sam3.pt"
+ANNOTATION_PATH="datasets/hr_data/mnt/sdb/llp/datasets/zoom_eye_data/zoom_eye_data"
+SAM_MODEL_PATH="models/sam3/sam3/sam3.pt"
 NLP_MODEL_PATH="models/en_core_web_sm-3.8.0"
 
 NUM_CHUNKS=1
 CHUNK_IDX=0
 SPLIT_NUM=4
+DIRECT_ANSWER=0
 GPU_ID=0
 SAM_GPU_ID=1
 
@@ -31,6 +32,7 @@ usage() {
     echo "  --sam_gpu_id <id>      Physical GPU ID for SAM3 (default: ${SAM_GPU_ID})"
     echo "  --num_chunks <int>     Total number of chunks for parallel execution (default: ${NUM_CHUNKS})"
     echo "  --chunk_idx <int>      Index of the current chunk (default: ${CHUNK_IDX})"
+    echo "  --direct_answer        Run the vanilla backbone baseline (no CVSearch)"
     echo "  --help                 Show this help message"
     echo ""
     echo "Example:"
@@ -47,6 +49,7 @@ while [[ "$#" -gt 0 ]]; do
         --sam_gpu_id) SAM_GPU_ID="$2"; shift ;;
         --num_chunks) NUM_CHUNKS="$2"; shift ;;
         --chunk_idx) CHUNK_IDX="$2"; shift ;;
+        --direct_answer) DIRECT_ANSWER=1 ;;
         --help) usage ;;
         *) echo "❌ Unknown parameter passed: $1"; usage ;;
     esac
@@ -54,13 +57,15 @@ while [[ "$#" -gt 0 ]]; do
 done
 
 # 4. Set the GPU device
-# VLM -> cuda:0, SAM3 -> cuda:1 (logical indices after remapping)
+# --gpu_id may list several GPUs (e.g. "0,1") to shard the VLM across them; SAM3 goes on the next logical GPU.
+NUM_VLM_GPUS=$(echo "${GPU_ID}" | awk -F, '{print NF}')
+export VLM_NUM_GPUS=${NUM_VLM_GPUS}
 if [ "${GPU_ID}" = "${SAM_GPU_ID}" ]; then
     export CUDA_VISIBLE_DEVICES=${GPU_ID}
     SAM_DEVICE="cuda:0"
 else
     export CUDA_VISIBLE_DEVICES=${GPU_ID},${SAM_GPU_ID}
-    SAM_DEVICE="cuda:1"
+    SAM_DEVICE="cuda:${NUM_VLM_GPUS}"
 fi
 
 # ==============================================================================
@@ -74,6 +79,9 @@ echo "GPU IDs    : ${CUDA_VISIBLE_DEVICES} (VLM=cuda:0, SAM3=${SAM_DEVICE})"
 echo "Chunks    : ${CHUNK_IDX} / ${NUM_CHUNKS}"
 echo "========================================================================"
 
+DIRECT_ANSWER_FLAG=""
+if [ "${DIRECT_ANSWER}" = "1" ]; then DIRECT_ANSWER_FLAG="--direct-answer"; fi
+
 # Execute the Python inference script for CVSearch
 python perform_CVSearch.py \
     --root-path "${ROOT_PATH}" \
@@ -86,7 +94,8 @@ python perform_CVSearch.py \
     --nlp-model-path "${NLP_MODEL_PATH}" \
     --num-chunks ${NUM_CHUNKS} \
     --chunk-idx ${CHUNK_IDX} \
-    --split-num ${SPLIT_NUM}
+    --split-num ${SPLIT_NUM} \
+    ${DIRECT_ANSWER_FLAG}
 
 # ------------------------------------------------------------------------------
 # Baseline Comparison

@@ -1,3 +1,4 @@
+import os
 import torch
 from torch.nn import CrossEntropyLoss
 from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
@@ -16,7 +17,13 @@ class ModelQwenVL:
             device_map = {"": self.device}
         else:
             device_map = self.device
-        self.use_flash_attn = True
+            # VLM_NUM_GPUS > 1: shard the VLM evenly across the first N visible GPUs (for small-memory GPUs)
+            num_vlm_gpus = int(os.environ.get("VLM_NUM_GPUS", "1"))
+            if num_vlm_gpus > 1:
+                device_map = "balanced"
+                load_kwargs["max_memory"] = {i: "9GiB" for i in range(num_vlm_gpus)}
+        import importlib.util
+        self.use_flash_attn = importlib.util.find_spec("flash_attn") is not None
         actual_attn_implementation = "flash_attention_2" if self.use_flash_attn else None
         print(f"Flash Attention Enabled: {self.use_flash_attn} (Backend: {actual_attn_implementation})")
         ###Qwen2.5-VL
@@ -332,7 +339,7 @@ class ModelQwenVL:
             padding_side="left",
         )
         model_inputs = model_inputs.to(self.device)
-        outputs = self.model(**model_inputs)
+        outputs = self.model(**model_inputs, logits_to_keep=1)  # only the last-token logits are used
 
         return self._cal_confidence(outputs)
 
@@ -409,8 +416,8 @@ class ModelQwenVL:
         model_inputs = model_inputs.to(self.device)
         question_input_ids = model_inputs.input_ids
         len_question_input_ids = question_input_ids.shape[1]
-        output_question = self.model(**model_inputs)
-        len_question_logits = output_question.logits.shape[1]
+        # logits length == input length, so no forward pass is needed to get it
+        len_question_logits = len_question_input_ids
 
         loss_list = []
         for option in options:
@@ -426,8 +433,10 @@ class ModelQwenVL:
             full_model_inputs = full_model_inputs.to(self.device)
             full_input_ids = full_model_inputs.input_ids
 
-            output_option = self.model(**full_model_inputs)
-            logits = output_option.logits[:, len_question_logits - 1:-1]
+            # only the option-token positions are scored; skip the lm_head on the (image) prefix to save memory
+            keep = full_input_ids.shape[1] - (len_question_logits - 1)
+            output_option = self.model(**full_model_inputs, logits_to_keep=keep)
+            logits = output_option.logits[:, :-1]
 
             loss_fct = CrossEntropyLoss()
             logits = logits.view(-1, logits.size(-1))
