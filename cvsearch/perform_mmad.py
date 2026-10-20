@@ -10,6 +10,8 @@ Modes:
   --patchcore <dir>               E5: if the image's PatchCore score is above the per-class threshold, add the main image
                                   with the PatchCore top-1 box drawn + a zoomed crop of that box; otherwise answer directly
                                   (<dir> = output of industrial/eval_patchcore.py + industrial/select_thresholds.py)
+  --patchcore <dir> --cvsearch    E6: CVSearch pipeline (answering-confidence gate + zoomed view) where the region to zoom
+                                  into is the PatchCore top-1 box instead of a SAM3 text detection (search_mode 4)
 """
 import argparse
 import collections
@@ -130,6 +132,8 @@ if __name__ == "__main__":
                         help="do not re-run SAM3 on the best tree candidate (search_mode=False)")
     parser.add_argument("--patchcore", type=str, default=None,
                         help="E5: dir with per_image.jsonl + thresholds.json (relative to --root-path)")
+    parser.add_argument("--cvsearch", action="store_true",
+                        help="with --patchcore: E6, CVSearch with the PatchCore box as the search result")
     parser.add_argument("--pc-ungated", action="store_true", help="E5 ablation: add the PatchCore crop to every image")
     parser.add_argument("--sam-model-path", type=str, default="models/sam3/sam3/sam3.pt")
     parser.add_argument("--nlp-model-path", type=str, default="models/en_core_web_sm-3.8.0")
@@ -145,7 +149,7 @@ if __name__ == "__main__":
     if args.direct_answer:
         mode = "direct_answer"
     elif args.patchcore:
-        mode = "patchcore" + ("_ungated" if args.pc_ungated else "")
+        mode = "cvsearch_patchcore" if args.cvsearch else "patchcore" + ("_ungated" if args.pc_ungated else "")
     else:
         mode = f"cvsearch_{args.search_target}" + ("_tree" if args.force_tree else "")
 
@@ -165,12 +169,8 @@ if __name__ == "__main__":
         records = [json.loads(l) for l in open(outputs_path)]
     else:
         model = ModelQwenVL(model_path=model_path, device=args.vlm_device, torch_dtype=torch.bfloat16, patch_scale=1.2)
-        if args.search_target:
-            import spacy
-            from models.modeling_sam3 import sam3_inference
+        if args.search_target or args.cvsearch:
             from CVSearch import get_cvsearch_response
-            nlp = spacy.load(name=os.path.join(args.root_path, args.nlp_model_path))
-            sam3 = sam3_inference(model_path=os.path.join(args.root_path, args.sam_model_path), device=args.sam_device)
             # same search hyper-parameters as the Qwen branch of perform_CVSearch.py
             search_kwargs = {
                 "pop_limit": lambda max_depth: max_depth * 3,
@@ -179,6 +179,11 @@ if __name__ == "__main__":
                 "answering_confidence_threshold_upper": 0.9,
                 "fast_threshold": 0.6,
             }
+        if args.search_target:
+            import spacy
+            from models.modeling_sam3 import sam3_inference
+            nlp = spacy.load(name=os.path.join(args.root_path, args.nlp_model_path))
+            sam3 = sam3_inference(model_path=os.path.join(args.root_path, args.sam_model_path), device=args.sam_device)
             ic_examples = json.load(open("ic_examples/vstar.json"))
         if args.patchcore:
             pc_dir = os.path.join(args.root_path, args.patchcore)
@@ -200,6 +205,17 @@ if __name__ == "__main__":
                         force_tree=args.force_tree, search_mode=not args.no_second_search, **search_kwargs)
                     extra = {k: ann.get(k) for k in ["search_mode", "root_ans_conf", "targets", "sam", "num_pop",
                                                      "searched_bbox"]}
+                elif args.cvsearch:
+                    p = pc[q["image_path"]]
+                    ann = {"input_image": image_file, "question": q["question"], "answer_type": "preformatted",
+                           "final_prompt": prompt}
+                    # SAM3 / spaCy are only used for text grounding, which fixed_bboxes replaces
+                    raw = get_cvsearch_response(
+                        sam_model=None, zoom_model=model, nlp_model=None, annotation=ann, ic_examples=None,
+                        decomposed_question_template="What is the appearance of the {}?",
+                        fixed_bboxes=[p["pc_box"]], **search_kwargs)
+                    extra = {k: ann.get(k) for k in ["search_mode", "root_ans_conf", "searched_bbox"]}
+                    extra.update(pc_score=p["score"], pc_box=p["pc_box"])
                 elif args.patchcore:
                     image = Image.open(image_file).convert("RGB")
                     p = pc[q["image_path"]]

@@ -29,6 +29,7 @@ def get_cvsearch_response(
         enable_parent_verification=False,
         fixed_targets=None,
         force_tree=False,
+        fixed_bboxes=None,
 ):
     # Data loading
     #Default single_target: tree_depth_s = 2, cross_target: tree_depth_c = 3
@@ -62,6 +63,20 @@ def get_cvsearch_response(
         annotation['num_zoom_in'] = []
         annotation['num_zoom_out'] = []
         annotation['search_mode'] = 0
+        annotation['sam'].append(None)
+    elif fixed_bboxes is not None:
+        #####External localization########
+        # e.g. MMAD + PatchCore: the caller gives the regions (xyxy) to zoom into instead of SAM3 text grounding
+        for x0, y0, x1, y1 in fixed_bboxes:
+            node = NodeA(NodeState(image_pil, [x0, y0, x1 - x0, y1 - y0]))
+            node.search_source = "fast"
+            searched_nodes.append(node)
+        annotation['targets'] = None
+        annotation['target_sign'] = None
+        annotation['num_pop'] = [0]
+        annotation['num_zoom_in'] = [0]
+        annotation['num_zoom_out'] = [0]
+        annotation['search_mode'] = 4
         annotation['sam'].append(None)
     else:
         #####Visual Search########
