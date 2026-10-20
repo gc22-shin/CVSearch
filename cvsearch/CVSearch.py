@@ -27,6 +27,8 @@ def get_cvsearch_response(
         image_folder: str = None,
         search_mode=True,
         enable_parent_verification=False,
+        fixed_targets=None,
+        force_tree=False,
 ):
     # Data loading
     #Default single_target: tree_depth_s = 2, cross_target: tree_depth_c = 3
@@ -65,7 +67,11 @@ def get_cvsearch_response(
         #####Visual Search########
         # print("Visual Search!")
         # key object extract
-        targets = zoom_model.generate_visual_cues_using_ic(ic_examples, question)
+        if fixed_targets is not None:
+            # e.g. MMAD: the question names no object, so the caller gives the search target
+            targets = list(fixed_targets)
+        else:
+            targets = zoom_model.generate_visual_cues_using_ic(ic_examples, question)
         #For the visual cues like "man and his bag", we should remove the pronoun "his bag"
         targets = [t for t in targets if not include_pronouns(nlp_model, t)]
         #For the visual cues like "all dogs", we convert it to "dog"
@@ -96,6 +102,10 @@ def get_cvsearch_response(
 
         ####sam3 result -> bbox
         sam_success_flags, sam_bboxes = process_sam_result(processed_results, target_id, is_search_second)
+        if force_tree:
+            # ablation: ignore SAM3's text detections so that every target goes through the tree search
+            sam_success_flags = [0] * len(sam_success_flags)
+            sam_bboxes = [[] for _ in sam_bboxes]
 
         # Adaptive visual search
         if target_sign:
@@ -466,6 +476,9 @@ def get_cvsearch_response(
             answers.append(zoom_model.free_form_using_nodes(image_pil, question_input, searched_nodes))
         return answers
     # For mme-realworld
+    elif answer_type == "preformatted":
+        # the caller already built the final prompt (same prompt as its direct-answer baseline)
+        return zoom_model.free_form_using_nodes(image_pil, annotation['final_prompt'], searched_nodes)
     elif answer_type == "Multiple Choice":
         question_input = format_question_multichoice(question, options)
         response = zoom_model.free_form_using_nodes(image_pil, question_input, searched_nodes)
