@@ -493,7 +493,12 @@ def get_cvsearch_response(
     # For mme-realworld
     elif answer_type == "preformatted":
         # the caller already built the final prompt (same prompt as its direct-answer baseline)
-        return zoom_model.free_form_using_nodes(image_pil, annotation['final_prompt'], searched_nodes)
+        response = zoom_model.free_form_using_nodes(image_pil, annotation['final_prompt'], searched_nodes)
+        if annotation.get('swap_prompt'):
+            # second answering pass on the SAME searched views with the option order swapped (letter probabilities only)
+            annotation['swap_letter_logmass'] = zoom_model.letter_logmass_using_nodes(
+                image_pil, annotation['swap_prompt'], searched_nodes)
+        return response
     elif answer_type == "Multiple Choice":
         question_input = format_question_multichoice(question, options)
         response = zoom_model.free_form_using_nodes(image_pil, question_input, searched_nodes)

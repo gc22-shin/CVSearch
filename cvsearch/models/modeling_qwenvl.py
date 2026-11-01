@@ -73,6 +73,7 @@ class ModelQwenVL:
 
         self.init_prompts()
         self.init_index_yes_no()
+        self.init_letter_tokens()
 
     def init_index_yes_no(self):
         print("Yes:", self.tokenizer("Yes").input_ids)
@@ -86,6 +87,29 @@ class ModelQwenVL:
             self.index_no = self.tokenizer("No").input_ids[1]
         print("index_yes:", self.index_yes)
         print("index_no:", self.index_no)
+
+    def init_letter_tokens(self, letters="ABCDEFGH"):
+        """Token ids that can carry an option letter at the answer position ("A" and " A" variants, single tokens only).
+
+        With capture_letter_logmass=True, free_form_using_nodes stores in last_letter_logmass the log of the probability
+        mass the model puts on each letter (full-vocabulary softmax at the first generated position, summed over the
+        variants). Generation itself is unchanged (greedy), so answers do not depend on this flag."""
+        self.letter_token_ids = {}
+        for letter in letters:
+            ids = set()
+            for variant in (letter, " " + letter):
+                t = self.tokenizer(variant, add_special_tokens=False).input_ids
+                if len(t) == 1:
+                    ids.add(t[0])
+            self.letter_token_ids[letter] = sorted(ids)
+        print("letter token ids:", self.letter_token_ids)
+        self.capture_letter_logmass = False
+        self.last_letter_logmass = None
+
+    def letter_logmass(self, logits):
+        """logits: 1-D vocab logits at the answer position -> {letter: log P(letter tokens)} (not renormalised)."""
+        logp = torch.log_softmax(logits.float(), dim=-1)
+        return {l: torch.logsumexp(logp[ids], dim=0).item() for l, ids in self.letter_token_ids.items()}
 
     def get_confidence_weight(self, node: Node, max_depth: int):
         coeff = (1 - self.bias_value) / (max_depth ** 2)
@@ -375,7 +399,13 @@ class ModelQwenVL:
             padding_side="left",
         )
         model_inputs = model_inputs.to(self.device)
-        generated_ids = self.model.generate(**model_inputs, use_cache=True, max_new_tokens=256, do_sample=False)
+        if self.capture_letter_logmass:
+            gen = self.model.generate(**model_inputs, use_cache=True, max_new_tokens=256, do_sample=False,
+                                      return_dict_in_generate=True, output_logits=True)
+            generated_ids = gen.sequences
+            self.last_letter_logmass = self.letter_logmass(gen.logits[0][0])
+        else:
+            generated_ids = self.model.generate(**model_inputs, use_cache=True, max_new_tokens=256, do_sample=False)
 
         generated_ids_trimmed = [
             out_ids[len(in_ids):] for in_ids, out_ids in zip(model_inputs.input_ids, generated_ids)
@@ -387,6 +417,23 @@ class ModelQwenVL:
             return response
 
         return outputs
+
+    @torch.inference_mode()
+    def letter_logmass_using_nodes(self, image_pil, question, searched_nodes: List[NodeA]):
+        """Forward-only twin of free_form_using_nodes: letter log-mass at the answer position for `question`
+        (same images / prompt construction), without generating."""
+        image_list = self.process_nodes_to_image_list(searched_nodes, image_pil)
+        image_input = [image_list[2]] if len(image_list) > 1 else image_list
+        pre_information = "pre_information_image2" if len(image_input) > 1 else "pre_information_image1"
+        prompt = self.get_prompt_from_qs(self.prompts["search"][pre_information] + question)
+        return self.letter_logmass_from_prompt(prompt, image_input)
+
+    @torch.inference_mode()
+    def letter_logmass_from_prompt(self, prompt, images):
+        model_inputs = self.processor(text=[prompt], images=images, return_tensors="pt", padding=True,
+                                      padding_side="left").to(self.device)
+        outputs = self.model(**model_inputs, logits_to_keep=1)
+        return self.letter_logmass(outputs.logits[0, -1])
 
     @torch.inference_mode()
     def multiple_choices_inference(self, image_pil, question, options, searched_nodes: List[NodeA] = None):

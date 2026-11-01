@@ -10,12 +10,20 @@ Modes:
   --patchcore <dir>               E5: if the image's PatchCore score is above the per-class threshold, add the main image
                                   with the PatchCore top-1 box drawn + a zoomed crop of that box; otherwise answer directly
                                   (<dir> = output of industrial/eval_patchcore.py + industrial/select_thresholds.py)
+  --log-option-probs              also store, per question, the probability the model puts on each option (softmax over
+                                  the option-letter tokens at the answer position, renormalised over the question's
+                                  options; keyed by letter and by option text). Answers are unchanged (greedy generation;
+                                  the first-step logits of the answering call are read). Works in every mode; for CVSearch
+                                  modes it is the FINAL answering call on the searched views.
+  --ad-swap                       with --log-option-probs: Anomaly Detection questions get a second pass on the same
+                                  views with the option order swapped; p_yes = mean P("Yes") over both orders
   --patchcore <dir> --cvsearch    E6: CVSearch pipeline (answering-confidence gate + zoomed view) where the region to zoom
                                   into is the PatchCore top-1 box instead of a SAM3 text detection (search_mode 4)
 """
 import argparse
 import collections
 import json
+import math
 import os
 import re
 import sys
@@ -60,9 +68,49 @@ def answer_with_images(model, images, qs):
     prompt = model.get_prompt_from_qs(qs)
     inputs = model.processor(text=[prompt], images=images, return_tensors="pt", padding=True, padding_side="left")
     inputs = inputs.to(model.device)
-    ids = model.model.generate(**inputs, use_cache=True, max_new_tokens=256, do_sample=False)
+    if model.capture_letter_logmass:
+        gen = model.model.generate(**inputs, use_cache=True, max_new_tokens=256, do_sample=False,
+                                   return_dict_in_generate=True, output_logits=True)
+        ids = gen.sequences
+        model.last_letter_logmass = model.letter_logmass(gen.logits[0][0])
+    else:
+        ids = model.model.generate(**inputs, use_cache=True, max_new_tokens=256, do_sample=False)
     return model.processor.batch_decode(ids[:, inputs.input_ids.shape[1]:], skip_special_tokens=True,
                                         clean_up_tokenization_spaces=False)[0]
+
+
+def is_yes(text):
+    return text.strip(". ").lower() == "yes"
+
+
+def swap_options(options):
+    """Reverse the option texts over the same letters (2 options: A<->B)."""
+    letters = list(options)
+    return {l: options[o] for l, o in zip(letters, reversed(letters))}
+
+
+def option_probs(logmass, options):
+    """Letter log-masses -> probabilities renormalised over this question's options, keyed by letter and by text."""
+    letters = list(options)
+    lse = torch.logsumexp(torch.tensor([logmass[l] for l in letters]), 0).item()
+    p = {l: math.exp(logmass[l] - lse) for l in letters}
+    return {"order": dict(options), "p_letter": p, "p_text": {options[l]: p[l] for l in letters},
+            "mass": math.exp(lse), "argmax": max(letters, key=p.get)}
+
+
+def option_prob_fields(q, pred, logmass, swap_logmass):
+    """Fields added to a record under --log-option-probs."""
+    out = {"opt": option_probs(logmass, q["options"])}
+    out["argmax_ok"] = out["opt"]["argmax"] == pred
+    if swap_logmass is not None:
+        out["opt_swap"] = option_probs(swap_logmass, swap_options(q["options"]))
+    if q["question_type"] == "Anomaly Detection":
+        py = [next(p for t, p in o["p_text"].items() if is_yes(t)) for o in (out["opt"], out.get("opt_swap")) if o]
+        out["p_yes_orig"] = py[0]
+        if len(py) > 1:
+            out["p_yes_swap"] = py[1]
+        out["p_yes"] = sum(py) / len(py)
+    return out
 
 
 def parse_letter(text, letters):
@@ -121,7 +169,8 @@ if __name__ == "__main__":
     parser.add_argument("--root-path", type=str, required=True)
     parser.add_argument("--model-path", type=str, default="models/Qwen3-VL-4B-Instruct")
     parser.add_argument("--data-path", type=str, default="datasets/mmad_subset")
-    parser.add_argument("--split", type=str, default="dev", choices=["dev", "val", "test"])
+    parser.add_argument("--split", type=str, default="dev", choices=["dev", "val", "test", "devpool"],
+                        help="devpool = dev+val+test (industrial/build_devpool.py)")
     parser.add_argument("--vlm-device", type=str, default="cuda:0")
     parser.add_argument("--direct-answer", action="store_true", help="vanilla backbone baseline (only mode implemented)")
     parser.add_argument("--search-target", type=str, default=None, choices=["object", "defect"],
@@ -135,6 +184,10 @@ if __name__ == "__main__":
     parser.add_argument("--cvsearch", action="store_true",
                         help="with --patchcore: E6, CVSearch with the PatchCore box as the search result")
     parser.add_argument("--pc-ungated", action="store_true", help="E5 ablation: add the PatchCore crop to every image")
+    parser.add_argument("--log-option-probs", action="store_true",
+                        help="store per-option probabilities (letter + text) of the answering call in outputs.jsonl")
+    parser.add_argument("--ad-swap", action="store_true",
+                        help="with --log-option-probs: second pass with swapped option order for Anomaly Detection")
     parser.add_argument("--sam-model-path", type=str, default="models/sam3/sam3/sam3.pt")
     parser.add_argument("--nlp-model-path", type=str, default="models/en_core_web_sm-3.8.0")
     parser.add_argument("--sam-device", type=str, default="cuda:1")
@@ -144,6 +197,8 @@ if __name__ == "__main__":
                         help="recompute summary.json from an existing outputs.jsonl (no model is loaded)")
     args = parser.parse_args()
 
+    if args.ad_swap and not args.log_option_probs:
+        raise SystemExit("--ad-swap needs --log-option-probs")
     if not args.direct_answer and not args.search_target and not args.patchcore and not args.rescore:
         raise SystemExit("choose a mode: --direct-answer, --search-target {object,defect} or --patchcore <dir>")
     if args.direct_answer:
@@ -169,6 +224,7 @@ if __name__ == "__main__":
         records = [json.loads(l) for l in open(outputs_path)]
     else:
         model = ModelQwenVL(model_path=model_path, device=args.vlm_device, torch_dtype=torch.bfloat16, patch_scale=1.2)
+        model.capture_letter_logmass = args.log_option_probs
         if args.search_target or args.cvsearch:
             from CVSearch import get_cvsearch_response
             # same search hyper-parameters as the Qwen branch of perform_CVSearch.py
@@ -194,10 +250,15 @@ if __name__ == "__main__":
             for q in tqdm(questions):
                 image_file = os.path.join(data_root, q["image_path"])
                 prompt = format_question(q["question"], q["options"])
+                swap_prompt = None
+                if args.ad_swap and q["question_type"] == "Anomaly Detection":
+                    swap_prompt = format_question(q["question"], swap_options(q["options"]))
+                model.last_letter_logmass = None
+                swap_lm = None
                 extra = {}
                 if args.search_target:
                     ann = {"input_image": image_file, "question": q["question"], "answer_type": "preformatted",
-                           "final_prompt": prompt}
+                           "final_prompt": prompt, "swap_prompt": swap_prompt}
                     fixed = [q["category"]] if args.search_target == "object" else ["defect"]
                     raw = get_cvsearch_response(
                         sam_model=sam3, zoom_model=model, nlp_model=nlp, annotation=ann, ic_examples=ic_examples,
@@ -205,39 +266,62 @@ if __name__ == "__main__":
                         force_tree=args.force_tree, search_mode=not args.no_second_search, **search_kwargs)
                     extra = {k: ann.get(k) for k in ["search_mode", "root_ans_conf", "targets", "sam", "num_pop",
                                                      "searched_bbox"]}
+                    swap_lm = ann.get("swap_letter_logmass")
                 elif args.cvsearch:
                     p = pc[q["image_path"]]
                     ann = {"input_image": image_file, "question": q["question"], "answer_type": "preformatted",
-                           "final_prompt": prompt}
+                           "final_prompt": prompt, "swap_prompt": swap_prompt}
                     # SAM3 / spaCy are only used for text grounding, which fixed_bboxes replaces
                     raw = get_cvsearch_response(
                         sam_model=None, zoom_model=model, nlp_model=None, annotation=ann, ic_examples=None,
                         decomposed_question_template="What is the appearance of the {}?",
                         fixed_bboxes=[p["pc_box"]], **search_kwargs)
                     extra = {k: ann.get(k) for k in ["search_mode", "root_ans_conf", "searched_bbox"]}
+                    swap_lm = ann.get("swap_letter_logmass")
                     extra.update(pc_score=p["score"], pc_box=p["pc_box"])
                 elif args.patchcore:
                     image = Image.open(image_file).convert("RGB")
                     p = pc[q["image_path"]]
                     use = args.pc_ungated or p["score"] > pc_thr[q["category"]]
                     if use:
-                        raw = answer_with_images(model, patchcore_views(model, image, p["pc_box"]), PC_PREFIX + prompt)
+                        views = patchcore_views(model, image, p["pc_box"])
+                        raw = answer_with_images(model, views, PC_PREFIX + prompt)
+                        if swap_prompt:
+                            swap_lm = model.letter_logmass_from_prompt(
+                                model.get_prompt_from_qs(PC_PREFIX + swap_prompt), views)
                     else:
                         raw = model.free_form_using_nodes(image, prompt, [])  # same path as the direct-answer baseline
+                        if swap_prompt:
+                            swap_lm = model.letter_logmass_using_nodes(image, swap_prompt, [])
                     extra = {"pc_score": p["score"], "pc_threshold": pc_thr[q["category"]], "pc_used": use,
                              "pc_box": p["pc_box"]}
                 else:
                     image = Image.open(image_file).convert("RGB")
                     raw = model.free_form_using_nodes(image, prompt, [])  # empty node list = direct answering
+                    if swap_prompt:
+                        swap_lm = model.letter_logmass_using_nodes(image, swap_prompt, [])
                 pred = parse_letter(raw, list(q["options"]))
                 rec = {k: q[k] for k in ["question_id", "image_id", "category", "question_type", "is_anomaly",
                                          "defect_type", "answer"]}
                 rec.update(pred=pred, correct=pred == q["answer"], raw_output=raw, **extra)
+                if args.log_option_probs:
+                    assert model.last_letter_logmass is not None, "answering call did not record letter probabilities"
+                    rec.update(option_prob_fields(q, pred, model.last_letter_logmass, swap_lm))
+                    if not rec["argmax_ok"]:
+                        print(f"[option-probs] argmax letter {rec['opt']['argmax']} != generated {pred} "
+                              f"({q['question_id']}; raw={raw!r})", flush=True)
                 records.append(rec)
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
     summary = summarize(records, options_by_qid)
     summary["config"] = {"model": args.model_path, "split": args.split, "mode": mode}
+    if any("opt" in r for r in records):
+        summary["option_probs"] = {
+            "n": sum("opt" in r for r in records),
+            "argmax_ne_generated": sum(not r["argmax_ok"] for r in records if "opt" in r),
+            "argmax_ne_generated_qids": [r["question_id"] for r in records if "opt" in r and not r["argmax_ok"]],
+            "min_option_mass": min(r["opt"]["mass"] for r in records if "opt" in r),
+            "ad_swap": sum("opt_swap" in r for r in records)}
     if any("pc_used" in r for r in records):
         summary["patchcore_crop_questions"] = sum(bool(r["pc_used"]) for r in records)
     if any("search_mode" in r for r in records):
