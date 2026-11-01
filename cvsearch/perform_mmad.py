@@ -169,8 +169,9 @@ if __name__ == "__main__":
     parser.add_argument("--root-path", type=str, required=True)
     parser.add_argument("--model-path", type=str, default="models/Qwen3-VL-4B-Instruct")
     parser.add_argument("--data-path", type=str, default="datasets/mmad_subset")
-    parser.add_argument("--split", type=str, default="dev", choices=["dev", "val", "test", "devpool"],
-                        help="devpool = dev+val+test (industrial/build_devpool.py)")
+    parser.add_argument("--split", type=str, default="dev",
+                        help="reads <data-path>/splits/<split>_questions.jsonl: dev | val | test (original split), "
+                             "devpool = dev+val+test (industrial/build_devpool.py), or any other prepared question file")
     parser.add_argument("--vlm-device", type=str, default="cuda:0")
     parser.add_argument("--direct-answer", action="store_true", help="vanilla backbone baseline (only mode implemented)")
     parser.add_argument("--search-target", type=str, default=None, choices=["object", "defect"],
